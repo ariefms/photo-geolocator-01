@@ -204,6 +204,7 @@ function decodeJpegDc(buf: Buffer): RgbBlock[][] {
   const huffDc: (Huff | undefined)[] = [];
   const huffAc: (Huff | undefined)[] = [];
   let restartInterval = 0;
+  let frame: { width: number; height: number; comps: Omit<JpegComponent, 'dcTable' | 'acTable'>[] } | null = null;
   let pos = 2;
   while (pos + 3 < buf.length) {
     if (buf[pos] !== 0xff) throw new Error('bad JPEG marker');
@@ -248,7 +249,7 @@ function decodeJpegDc(buf: Buffer): RgbBlock[][] {
     } else if (marker === 0xdd) {
       restartInterval = (seg[0]! << 8) | seg[1]!;
     } else if (marker === 0xc0) {
-      // SOF0 (baseline): keep the frame for the SOS below.
+      // SOF0 (baseline): the SOS handler below reads this frame back.
       const height = (seg[1]! << 8) | seg[2]!;
       const width = (seg[3]! << 8) | seg[4]!;
       const ncomp = seg[5]!;
@@ -261,12 +262,9 @@ function decodeJpegDc(buf: Buffer): RgbBlock[][] {
           tq: seg[8 + i * 3]!,
         });
       }
-      // Stash the frame on the function via a marker segment: the SOS
-      // handler below reads it back through this closure variable.
-      frameHolder.frame = { width, height, comps };
+      frame = { width, height, comps };
     } else if (marker === 0xda) {
       // SOS: the scan data runs from here to the next marker.
-      const frame = frameHolder.frame;
       if (frame === null) throw new Error('JPEG SOS before SOF');
       const ncomp = seg[0]!;
       const scanComps: JpegComponent[] = [];
@@ -283,10 +281,6 @@ function decodeJpegDc(buf: Buffer): RgbBlock[][] {
   }
   throw new Error('no JPEG SOS segment found');
 }
-
-const frameHolder: {
-  frame: { width: number; height: number; comps: Omit<JpegComponent, 'dcTable' | 'acTable'>[] } | null;
-} = { frame: null };
 
 function decodeScan(
   frame: { width: number; height: number; comps: Omit<JpegComponent, 'dcTable' | 'acTable'>[] },
@@ -444,7 +438,9 @@ function measureCues(grid: RgbBlock[][]): Cues {
 async function main(): Promise<number> {
   const envUrl = need('MAKEFUN_ENV_URL').replace(/\/+$/, '');
   const listed = (await (await fetch(`${envUrl}/photos`)).json()) as { photos: Photo[] };
-  const photos = listed.photos;
+  // A photo the env already holds an answer for takes no second one: posting
+  // it again would refuse the whole batch (409), so answer only the open ones.
+  const photos = listed.photos.filter((p) => !p.answered);
   const answers: Guess[] = [];
   for (const p of photos) {
     let note = 'anchor';
@@ -471,7 +467,15 @@ async function main(): Promise<number> {
     if (!res.ok) throw new Error(`POST /answers HTTP ${res.status}: ${text.slice(0, 200)}`);
     return JSON.parse(text) as { accepted: string[]; left: number };
   };
-  const first = await post(answers);
+  let first: { accepted: string[]; left: number };
+  try {
+    first = await post(answers);
+  } catch (err) {
+    // The batch was refused whole (or the request never arrived): fall
+    // through to the confirm step below, which re-posts only what is missing.
+    process.stderr.write(`geolocator: first POST failed (${(err as Error).message}), confirming what is missing\n`);
+    first = { accepted: [], left: answers.length };
+  }
   process.stdout.write(`geolocator: posted ${first.accepted.length} answers, ${first.left} left\n`);
   if (first.left > 0) {
     // The first POST was refused whole or partly: re-post only what is missing.
